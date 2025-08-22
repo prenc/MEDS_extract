@@ -890,8 +890,6 @@ def main(cfg: DictConfig):
                         logger.info(f"Found matching file {matching_files[0]} for {input_fp}")
                         input_fp = matching_files[0]
 
-            out_fp = out_dir / sp / f"{input_prefix}.parquet"
-
             event_cfgs = copy.deepcopy(event_cfgs)
             input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
 
@@ -900,6 +898,7 @@ def main(cfg: DictConfig):
                 input_prefix: str,
                 event_cfgs: dict,
                 sp: str,
+                date_cutoff_expr: pl.Expr | None,
             ) -> Callable[[pl.LazyFrame], pl.LazyFrame]:
                 def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
                     if input_subject_id_column != "subject_id":
@@ -907,7 +906,7 @@ def main(cfg: DictConfig):
 
                     try:
                         logger.info(f"Extracting events for {input_prefix}")
-                        return convert_to_events(
+                        df = convert_to_events(
                             df,
                             event_cfgs=copy.deepcopy(event_cfgs),
                             do_dedup_text_and_numeric=cfg.stage_cfg.get("do_dedup_text_and_numeric", False),
@@ -915,15 +914,50 @@ def main(cfg: DictConfig):
                     except Exception as e:  # pragma: no cover
                         raise ValueError(f"Error converting to MEDS for {sp}/{input_prefix}: {e}") from e
 
+                    if date_cutoff_expr is not None and "time" in df.collect_schema():
+                        df = df.filter(date_cutoff_expr)
+
+                    return df
+
                 return compute_fn
 
-            rwlock_wrap(
-                input_fp,
-                out_fp,
-                read_fn,
-                write_df,
-                compute_fntr(input_subject_id_column, input_prefix, event_cfgs, sp),
-                do_overwrite=cfg.do_overwrite,
-            )
+            fold_suffixes, exprs = [""], [None]
+            if cfg.stage_cfg.cutoff_date is not None:
+                cutoff_date = pl.lit(cfg.stage_cfg.cutoff_date).str.strptime(pl.Datetime, "%Y-%m-%d")
+                fold_suffixes.append("_prospective")
+                exprs = [
+                    (pl.col("time") < cutoff_date) | pl.col("time").is_null(),
+                    (cutoff_date <= pl.col("time"))
+                    | pl.col("time").is_null()
+                    | (pl.col("code") == "MEDS_BIRTH"),
+                ]
+
+            for fold_sfx, expr in zip(fold_suffixes, exprs, strict=False):
+                logger.warning(f"{fold_sfx}: {expr}")
+                fold, shard_no = sp.split("/")
+                out_fp = out_dir / (fold + fold_sfx) / shard_no / f"{input_prefix}.parquet"
+                rwlock_wrap(
+                    input_fp,
+                    out_fp,
+                    read_fn,
+                    write_df,
+                    compute_fntr(input_subject_id_column, input_prefix, event_cfgs, sp, expr),
+                    do_overwrite=cfg.do_overwrite,
+                )
 
     logger.info("Subsharded into converted events.")
+
+    if cfg.stage_cfg.cutoff_date is not None:
+        shards_map_fp = Path(cfg.shards_map_fp)
+        logger.info(f"Updating sharded subjects to {shards_map_fp.resolve()!s}")
+        sharded_subjects = json.loads(shards_map_fp.read_text())
+        shard_names = [shard_name.split("/") for shard_name in sharded_subjects]
+        if any(shard_name[0].endswith("_prospective") for shard_name in shard_names):
+            return
+
+        for shard_name in shard_names:
+            new_shard_name = "/".join([shard_name[0] + "_prospective", *shard_name[1:]])
+            sharded_subjects[new_shard_name] = sharded_subjects["/".join(shard_name)]
+
+        shards_map_fp.write_text(json.dumps(sharded_subjects))
+        logger.info("Done writing sharded subjects")
