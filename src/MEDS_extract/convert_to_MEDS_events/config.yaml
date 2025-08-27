@@ -1,2 +1,2 @@
 do_dedup_text_and_numeric: True
-cutoff_date: "2006-01-01"
+cutoff_date: null
